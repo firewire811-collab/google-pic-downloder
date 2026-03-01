@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(gh repo view firewire811-collab/google-pic-downlader)",
+      "Bash(git --version)",
+      "Bash(git -C /d/workspace/myo status)",
+      "Bash(git config --global user.name)",
+      "Bash(git config --global user.email)",
+      "Bash(git init)",
+      "Bash(git remote add origin https://github.com/firewire811-collab/google-pic-downlader.git)",
+      "Bash(git fetch origin)",
+      "WebFetch(domain:github.com)",
+      "Bash(git remote add origin https://github.com/firewire811-collab/google-pic-downloder.git)",
+      "Bash(git add .gitignore AGENTS.md README.md main.py requirements.txt app/__init__.py app/db.py app/dezoomify.py app/main_window.py app/metadata.py app/paths.py)",
+      "Bash(git commit:*)",
+      "Bash(git branch -M main)",
+      "Bash(git push -u origin main)"
+    ]
+  }
+}
