@@ -9,8 +9,8 @@ from typing import cast
 
 import requests
 
-from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QClipboard, QGuiApplication, QImage, QPixmap
+from PyQt6.QtCore import QEvent, QObject, QThread, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QClipboard, QGuiApplication, QImage, QImageReader, QPixmap
 from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
@@ -115,6 +115,8 @@ def _display_scaled_size(width: int, height: int) -> tuple[int, int]:
 
 
 def _resize_for_display(src_path: Path, dst_path: Path) -> None:
+    # Dezoomify 초고해상도 이미지는 디코딩 시 256MB 기본 제한을 초과할 수 있으므로 상향
+    QImageReader.setAllocationLimit(1024)
     image = QImage(str(src_path))
     if image.isNull():
         raise ValueError("이미지 로드에 실패했습니다.")
@@ -193,6 +195,8 @@ class MainWindow(QMainWindow):
         self._pw_worker: _DezoomifyWorker | None = None
         self._last_checked_row: int | None = None
         self._all_checked: bool = False
+        self._no_sort_asc: bool | None = None  # None=미정렬, True=오름차순, False=내림차순
+        self._active_artwork: Artwork | None = None  # 현재 다운로드 중인 작품 (로그용)
 
         self._build_ui()
 
@@ -256,6 +260,8 @@ class MainWindow(QMainWindow):
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         self.table.cellClicked.connect(self._on_cell_clicked)
+        self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
+        self.table.viewport().installEventFilter(self)
 
         hdr = self.table.horizontalHeader()
         if hdr is not None:
@@ -328,6 +334,20 @@ class MainWindow(QMainWindow):
 
         self._update_output_dir_label()
 
+    # -----------------
+    # Event filter
+    # -----------------
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # type: ignore[override]
+        """우클릭이 row selection을 변경하지 않도록 차단한다."""
+        if obj is self.table.viewport():
+            if event.type() == QEvent.Type.MouseButtonPress:
+                from PyQt6.QtGui import QMouseEvent
+                me = event  # type: ignore[assignment]
+                if isinstance(me, QMouseEvent) and me.button() == Qt.MouseButton.RightButton:
+                    return True  # 이벤트 소비 → Qt 기본 selection 변경 차단
+        return super().eventFilter(obj, event)
+
     def _wire_clipboard(self) -> None:
         self._clipboard.dataChanged.connect(self._on_clipboard_changed)
 
@@ -389,6 +409,12 @@ class MainWindow(QMainWindow):
 
     def _reload_table(self, *, select_id: int | None = None) -> None:
         self._artworks = self._db.list_artworks()
+        if self._no_sort_asc is not None:
+            self._artworks = sorted(
+                self._artworks,
+                key=lambda a: a.seq_no,
+                reverse=not self._no_sort_asc,
+            )
         self.table.setRowCount(0)
         for row_idx, a in enumerate(self._artworks):
             self.table.insertRow(row_idx)
@@ -435,14 +461,30 @@ class MainWindow(QMainWindow):
         return ids
 
     def _on_header_clicked(self, section: int) -> None:
-        if section != 0:
-            return
-        self._all_checked = not self._all_checked
-        state = Qt.CheckState.Checked if self._all_checked else Qt.CheckState.Unchecked
-        for r in range(self.table.rowCount()):
-            item = self.table.item(r, 0)
-            if item:
-                item.setCheckState(state)
+        if section == 0:
+            # 체크박스 전체 선택/해제
+            self._all_checked = not self._all_checked
+            state = Qt.CheckState.Checked if self._all_checked else Qt.CheckState.Unchecked
+            for r in range(self.table.rowCount()):
+                item = self.table.item(r, 0)
+                if item:
+                    item.setCheckState(state)
+
+        elif section == 1:
+            # No. 컬럼: 오름차순 ↔ 내림차순 toggle
+            self._no_sort_asc = not self._no_sort_asc if self._no_sort_asc is not None else True
+            self._reload_table()
+            self._update_no_header_label()
+
+    def _update_no_header_label(self) -> None:
+        """No. 컬럼 헤더에 정렬 방향 표시 (▲ 오름차순 / ▼ 내림차순)."""
+        if self._no_sort_asc is True:
+            label = "No. ▲"
+        elif self._no_sort_asc is False:
+            label = "No. ▼"
+        else:
+            label = "No."
+        self.table.setHorizontalHeaderItem(1, QTableWidgetItem(label))
 
     def _on_cell_clicked(self, row: int, col: int) -> None:
         modifiers = QGuiApplication.keyboardModifiers()
@@ -472,8 +514,21 @@ class MainWindow(QMainWindow):
                     item.setCheckState(new_state)
             self._last_checked_row = row
         else:
-            if col == 0:
-                self._last_checked_row = row
+            # checkbox 컬럼이 아닌 제목 등 다른 컬럼 클릭 시에도 anchor를 갱신해야
+            # 이후 Shift+클릭의 range 기준이 올바르게 동작한다.
+            self._last_checked_row = row
+
+    def _on_cell_double_clicked(self, row: int, col: int) -> None:
+        """제목(col=2) 더블클릭 시 해당 그림의 링크를 브라우저 새 탭에서 연다."""
+        if col != 2:
+            return
+        chk = self.table.item(row, 0)
+        if chk is None:
+            return
+        artwork_id = chk.data(Qt.ItemDataRole.UserRole)
+        a = self._db.get_artwork(artwork_id)
+        if a:
+            webbrowser.open_new_tab(a.asset_url)
 
     def _on_selection_changed(self) -> None:
         ids = self._selected_artwork_ids()
@@ -579,9 +634,11 @@ class MainWindow(QMainWindow):
         a = self._db.get_artwork(self._active_download.artwork_id)
         if not a:
             self._active_download = None
+            self._active_artwork = None
             self._advance_queue()
             return
 
+        self._active_artwork = a
         dst = self._output_path_for_artwork(a)
         self.queue_status.setText(f"진행 중 ({self._processed_count}/{self._total_in_queue}): {a.title}")
         self._start_playwright_download(a.asset_url, dst)
@@ -591,7 +648,9 @@ class MainWindow(QMainWindow):
         if self._pw_thread is not None:
             try:
                 self._pw_thread.quit()
-                self._pw_thread.wait(250)
+                if not self._pw_thread.wait(5000):
+                    self._pw_thread.terminate()
+                    self._pw_thread.wait(3000)
             except Exception:
                 pass
 
@@ -618,17 +677,41 @@ class MainWindow(QMainWindow):
         self._pw_worker = worker
         thread.start()
 
+    def _log_download(self, *, success: bool, msg: str = "") -> None:
+        """다운로드 결과를 data/download_log.txt 에 기록한다."""
+        from datetime import datetime
+        a = self._active_artwork
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        status = "SUCCESS" if success else "FAIL   "
+        if a:
+            line = f"[{timestamp}] {status} | No.{a.seq_no:<4} | {a.title} | {a.asset_url}"
+        else:
+            line = f"[{timestamp}] {status} | (unknown artwork)"
+        if not success and msg:
+            line += f" | {msg}"
+        print(line, flush=True)
+        log_path = data_dir() / "download_log.txt"
+        try:
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception as e:
+            print(f"[LOG WRITE ERROR] {e}", flush=True)
+
     def _on_playwright_done(self, saved_path: str) -> None:
+        self._log_download(success=True)
         self.queue_status.setText(f"저장 완료: {saved_path}")
         self._active_download = None
+        self._active_artwork = None
         self._advance_queue()
 
     def _on_playwright_error(self, msg: str) -> None:
         self._error_count = getattr(self, "_error_count", 0) + 1
+        self._log_download(success=False, msg=msg)
         self.queue_status.setText(
             f"다운로드 실패 ({self._error_count}건 스킵): {msg[:80]}"
         )
         self._active_download = None
+        self._active_artwork = None
         self._advance_queue()
 
     def _play_completion_sound_10s(self) -> None:
